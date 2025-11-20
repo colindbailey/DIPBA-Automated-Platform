@@ -1,0 +1,992 @@
+#!/usr/bin/env python3
+ """
+ Purity-critical ML diversion with latched, transport-aware scheduling.
+ - Real physics preserved (reactor + post-line timing), safe to run on water.
+ - Quality-first: DIVERT overrides pending COLLECT immediately; pending DIVERT protected by no-cancel window.
+ - Robust "already in DIVERT/RUN" scheduling to avoid missed windows if arm timer matures after a state flip.
+ - Explicit action normalization ("ON"/"OFF" ↔ "DIVERT"/"COLLECT") to make latch logic correct.
+ """
+ 
+ import os, time, csv, datetime, ctypes, re, threading, heapq
+ from ctypes import c_uint32, c_uint8, c_int16, POINTER, byref
+ import serial
+ import u3
+ from pyModbusTCP.client import ModbusClient
+ from joblib import load as joblib_load
+ import numpy as np
+ from sklearn.neighbors import NearestNeighbors, KNeighborsRegressor
+ 
+ # ===================== USER CONFIG =====================
+ 
+ MODE = "WATER_TEST_ML_PURITY_CRITICAL"
+ 
+ # ----- ML model (bundle) -----
+ USE_ML_MODEL = True
+ MODEL_PATH = "tri_predictor_1p8_bundle.joblib" # deployed bundle
+ 
+ # Diversion policy (acts on Upper, not Mean):
+ UPPER_T_HI = 1.550 # enter divert threshold (mg/mL)
+ UPPER_T_LO = 1.500 # exit divert threshold (mg/mL)
+ EWMA_ALPHA = 0.25 # smoothing for Upper
+ VOTE_K, VOTE_N = 4, 6 # require 4 of last 6 EWMA readings ≥ T_HI to enter (purity first but still robust)
+ MIN_DIVERT_HOLD = 1 # min ticks to stay in DIVERT before reevaluating
+ MIN_RUN_HOLD = 1 # min ticks to stay in RUN before reevaluating
+ 
+ # Scheduling stability (latch & τ smoothing) — tuned for purity-first
+ ENTRY_ARM_SEC = 20.0 # was 60; quicker commitment to catch bad slugs
+ NO_CANCEL_SEC = 60.0 # protect scheduled DIVERT from cancel for 90 s
+ CANCEL_LOW_K, CANCEL_LOW_N = 3, 5 # need 4 of last 5 EWMA samples ≤ UPPER_T_LO to cancel opposite
+ CANCEL_TAU_SHIFT_FRAC = 0.15 # require ≥25% τ shift to cancel opposite (avoid flip-flop)
+ TAU_SMOOTH_ALPHA = 0.30 # EWMA for τ used in timing only
+ 
+ # Geometry & scheduling (realistic transport preserved)
+ REACTOR_VOLUME_ML = 30.0
+ POSTREACTOR_VOLUME_ML = 12.0 # total AFTER reactor (keep real post-line volume)
+ EXTRA_POST_TUBING_ML = 0.0
+ POST_LINE_FIXED_Q_ML_MIN = 8.0 # → fixed line-time = 1.5 min
+ DECISION_REF_FRACTION = 0.50 # decision reference at mid-reactor
+ SAFE_GOOD_FRACTION = 0.90 # purity-first: assume product remains "good" until 90% through (shorter remainder → earlier flip)
+ DIVERSION_EXTRA_FRAC = 0.03 # +3% OFF padding on return-to-collect
+ VALVE_ACTUATION_LATENCY_S = 0.30 # solenoid/relay lag pad
+ VALVE_COLLECT_ACTION = "OFF" # OFF=collect, ON=divert (typical wiring)
+ 
+ # Debug helper: keep transport model; set False in production as well
+ FAST_DIVERT = False # if True, DIVERT fires immediately after arming (actuation latency only)
+ 
+ # Runtime & sampling
+ RUN_SECONDS = 360000.0 # 60 minutes
+ SAMPLE_DT = 1.0
+ PRINT_PERIOD = 30.0 # pump print once per minute
+ STATUS_EVERY_S = 60.0 # ML heartbeat once per minute
+ 
+ # Hardware map
+ MAIN_HBA_SLI_COM = "COM6" # main flow sensor (HBA stream) used for τ
+ PAIRS = [
+ ("COM7", "COM11"),
+ ("COM8", "COM5"),
+ ("COM9", "COM6"), # SLI on COM6 is the main HBA stream
+ ]
+ 
+ # Pump setpoints
+ PUMP_TEST_RATE = 1.00 # default when not in PUMP_SETPOINTS
+ PUMP_SETPOINTS = {
+ "COM7": 2.0, # mL/min
+ "COM8": 4.0, # mL/min
+ # "COM9": <optional>
+ }
+ 
+ # --- Per-port SLI flow corrections (from your 2-min gravimetric tests) ---
+ # TrueFlow [mL/min] ≈ gain * SLI_flow [mL/min] + offset
+ FLOW_CORR = {
+ "COM6": {"gain": 3.78768, "offset": -0.32061}, # IPA (COM6)
+ "COM11": {"gain": 4.87110, "offset": -0.47943}, # toluene/ethanol (COM11)
+ }
+ 
+ # ---------------- Scale handling (COM10) ----------------
+ SCALE_PORT = "COM10" # set None to disable
+ SCALE_BAUD = 9600
+ SCALE_TIMEOUT_S = 0.5
+ 
+ # Chunked slope for scale (compute Δm/Δt once per chunk)
+ SCALE_CHUNK_SECONDS = 30.0 # one new flow value every ~30 s
+ 
+ # Interpret mass loss as positive inflow; ignore tiny noise
+ SCALE_FLOW_SIGN = -1.0 # reservoir gets lighter → positive flow
+ SCALE_DEADBAND_GPS = 0.0003 # g/s, values smaller → 0
+ ACID_DENSITY_G_PER_ML = 1.84 # ~98% H2SO4; used only to get mL/min from g/s (for τ)
+ 
+ # Scale I/O mode: poll for immediate (unstable) value
+ SCALE_MODE = "poll" # "poll", "stream", or "auto"
+ SCALE_POLL_CMD = b"SI\r" # Mettler Toledo: SI = send immediate, unstable
+ SCALE_POLL_PERIOD_S = 0.25 # poll 4×/s
+ SCALE_FLUSH_BEFORE_POLL = True
+ 
+ # Debug raw lines from scale (first N seconds)
+ SCALE_DEBUG_LOG = True
+ SCALE_DEBUG_SECONDS = 60
+ 
+ # ---------------- SLI averaging ----------------
+ SLI_AVG_WINDOW_S = 30.0 # seconds
+ 
+ # Huber (optional, read-only)
+ HUBER_IP = "10.0.0.1"
+ HUBER_PORT = 502
+ HUBER_UNIT = 255
+ REG_T_PROCESS = 7
+ 
+ # Valve (LabJack U3 + PS12DC)
+ VALVE_IO_NUM = 10
+ 
+ # Serial / SLI DLLs
+ PUMP_BAUD = 9600
+ SLI_BAUD = 115200
+ SLI_ADDR_DEFAULT = 0
+ SLI_INTERVAL_MS = 0
+ SLI_BUFFER_DELAY = 0.2
+ SLI_READ_GAP_S = 0.0
+ 
+ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ SHDLC_DLL = os.path.join(BASE_DIR, "ShdlcDriver.dll")
+ CABLE_DLL = os.path.join(BASE_DIR, "SensorCableDriver.dll")
+ 
+ CSV_NAME = f"run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{MODE}_60min.csv"
+ 
+ # ===================== Drivers =====================
+ 
+ _TERM = "/"
+ 
+ class EldexPump:
+ def __init__(self, port, baud=PUMP_BAUD, to=1.0):
+ self.port = port
+ self.ser = serial.Serial(port=port, baudrate=baud, bytesize=serial.EIGHTBITS,
+ parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_ONE,
+ timeout=to, write_timeout=2, dsrdtr=False, rtscts=False, xonxoff=False)
+ time.sleep(0.2)
+ def _read_until_term(self):
+ buf, start = "", time.time()
+ while True:
+ ch = self.ser.read(1).decode("ascii", errors="ignore")
+ if not ch:
+ if time.time() - start > self.ser.timeout: break
+ continue
+ buf += ch
+ if ch == _TERM: break
+ return buf
+ def cmd(self, text):
+ self.ser.write((text.strip() + "\r").encode("ascii"))
+ time.sleep(0.1)
+ return self._read_until_term()
+ def set_rate(self, ml_min): return self.cmd(f"RATE {ml_min:.3f}")
+ def start(self): return self.cmd("RUN")
+ def stop(self): return self.cmd("STOP")
+ def close(self):
+ try: self.ser.close()
+ except: pass
+ 
+ def _load_sli_libs():
+ if not os.path.isfile(SHDLC_DLL) or not os.path.isfile(CABLE_DLL):
+ raise FileNotFoundError("Place ShdlcDriver.dll and SensorCableDriver.dll next to this script.")
+ shdlc = ctypes.WinDLL(SHDLC_DLL)
+ cable = ctypes.WinDLL(CABLE_DLL)
+ shdlc.OpenPort.argtypes = (c_uint8, ctypes.c_char_p, POINTER(c_uint32))
+ shdlc.OpenPort.restype = c_uint32
+ shdlc.ClosePort.argtypes = (c_uint32,)
+ shdlc.ClosePort.restype = c_uint32
+ cable.StartContinuousMeasurement.argtypes = (c_uint32, c_uint8, c_uint8, ctypes.c_uint16)
+ cable.StartContinuousMeasurement.restype = c_uint32
+ cable.GetLastMeasurementSigned.argtypes = (c_uint32, c_uint8, c_uint8, POINTER(c_int16))
+ cable.GetLastMeasurementSigned.restype = c_uint32
+ cable.StopContinuousMeasurement.argtypes = (c_uint32, c_uint8, c_uint8)
+ cable.StopContinuousMeasurement.restype = c_uint32
+ return shdlc, cable
+ 
+ def _cfg_for_com_str(com_str):
+ m = re.search(r"(\d+)$", com_str, re.I)
+ if not m: raise ValueError(f"Bad COM string: {com_str}")
+ return f"COM{int(m.group(1))},{SLI_BAUD},EchoOff".encode("ascii")
+ 
+ class SLI2000:
+ def __init__(self, com_str, addr=SLI_ADDR_DEFAULT):
+ self.shdlc, self.cable = _load_sli_libs()
+ self.addr = c_uint8(addr)
+ self.handle = c_uint32(0)
+ self.com_str = com_str
+ cfg = _cfg_for_com_str(com_str)
+ err = self.shdlc.OpenPort(0, cfg, byref(self.handle))
+ if err != 0:
+ raise RuntimeError(f"OpenPort failed on {self.com_str}, code {err}")
+ self._running = False
+ def _stop_silent(self, addr):
+ try: self.cable.StopContinuousMeasurement(self.handle.value, c_uint8(0), c_uint8(addr))
+ except Exception: pass
+ def _try_start_once(self, addr):
+ self._stop_silent(addr); time.sleep(0.05)
+ return self.cable.StartContinuousMeasurement(self.handle.value, c_uint8(0), c_uint8(addr), ctypes.c_uint16(SLI_INTERVAL_MS))
+ def start(self):
+ for _ in range(2):
+ e = self._try_start_once(self.addr.value)
+ if e == 0:
+ self._running = True; time.sleep(SLI_BUFFER_DELAY); return
+ time.sleep(0.1)
+ last_err = None
+ for a in range(4):
+ for _ in range(2):
+ e = self._try_start_once(a); last_err = e
+ if e == 0:
+ self.addr = c_uint8(a); self._running = True; time.sleep(SLI_BUFFER_DELAY); return
+ time.sleep(0.1)
+ raise RuntimeError(f"StartContinuousMeasurement error {last_err} on {self.com_str} (tried addr 0–3)")
+ def read_raw(self):
+ val = c_int16()
+ e = self.cable.GetLastMeasurementSigned(self.handle.value, c_uint8(0), self.addr, byref(val))
+ if e != 0: raise RuntimeError(f"GetLastMeasurementSigned error {e}")
+ if SLI_READ_GAP_S > 0: time.sleep(SLI_READ_GAP_S)
+ return int(val.value)
+ def stop(self):
+ if self._running:
+ self.cable.StopContinuousMeasurement(self.handle.value, c_uint8(0), self.addr)
+ self._running = False
+ def close(self):
+ try: self.stop()
+ except: pass
+ try: self.shdlc.ClosePort(self.handle.value)
+ except: pass
+ 
+ class ValveU3:
+ def __init__(self, io_num=VALVE_IO_NUM):
+ self.io = io_num
+ self.dev = u3.U3()
+ self.dev.configIO(FIOAnalog=0)
+ self.dev.getFeedback(u3.BitDirWrite(self.io, 1))
+ self.dev.getFeedback(u3.BitStateWrite(self.io, 0))
+ def set(self, on):
+ self.dev.getFeedback(u3.BitStateWrite(self.io, 1 if on else 0))
+ def close(self):
+ try: self.set(False)
+ finally: self.dev.close()
+ 
+ def safe_read_huber_tprocess(ip=HUBER_IP, port=HUBER_PORT, unit=HUBER_UNIT, reg=REG_T_PROCESS):
+ try:
+ c = ModbusClient(host=ip, port=port, unit_id=unit, auto_open=True, timeout=1.2)
+ if not c.open(): return None
+ regs = c.read_holding_registers(reg, 1)
+ c.close()
+ if not regs: return None
+ raw = regs[0]
+ if raw & 0x8000: raw -= 0x10000
+ return raw / 100.0
+ except Exception:
+ return None
+ 
+ # ===================== Scale & SLI helpers =====================
+ 
+ SCALE_NUM_RE = re.compile(r"[-+]?\d*\.?\d+(?=\s*[gmGMkK])|[-+]?\d*\.?\d+$")
+ 
+ class BenchScale:
+ """Polls for immediate (unstable) weight; trims common status prefixes."""
+ def __init__(self, port, baud=SCALE_BAUD, timeout=SCALE_TIMEOUT_S):
+ self.ser = serial.Serial(port=port, baudrate=baud, timeout=timeout)
+ self.mode = SCALE_MODE.lower() if SCALE_MODE.lower() in ("auto","stream","poll") else "poll"
+ self._last_poll = 0.0
+ self._t0_debug = time.time()
+ self._poll_cmd = SCALE_POLL_CMD
+ def _log_raw(self, line: str):
+ if SCALE_DEBUG_LOG and (time.time() - self._t0_debug) <= SCALE_DEBUG_SECONDS:
+ print(f"[SCALE RAW] {line!r}")
+ def _readline(self):
+ try:
+ raw = self.ser.readline()
+ if not raw: return None
+ txt = raw.decode("ascii", errors="ignore").strip()
+ if txt: self._log_raw(txt)
+ return txt
+ except serial.SerialException:
+ return None
+ def _parse_mass_to_g(self, line: str) -> float | None:
+ norm = line.replace(",", ".").lower().strip()
+ for pfx in ("st,", "us,", "gs,", "s s", "s u", "u s", "u u"):
+ if norm.startswith(pfx):
+ norm = norm[len(pfx):].strip()
+ break
+ if "kg" in norm:
+ m = SCALE_NUM_RE.search(norm)
+ try: return float(m.group()) * 1000.0 if m else None
+ except: return None
+ m = SCALE_NUM_RE.search(norm)
+ try: return float(m.group()) if m else None
+ except: return None
+ def read_mass_g(self):
+ now = time.time()
+ if self.mode in ("poll","auto"):
+ if (now - self._last_poll) >= SCALE_POLL_PERIOD_S:
+ try:
+ if SCALE_FLUSH_BEFORE_POLL:
+ self.ser.reset_input_buffer()
+ self.ser.write(self._poll_cmd)
+ except Exception:
+ pass
+ self._last_poll = now
+ line = self._readline()
+ if not line: return None
+ return self._parse_mass_to_g(line)
+ def close(self):
+ try: self.ser.close()
+ except: pass
+ 
+ class ChunkedSlope:
+ """Collects mass readings for SCALE_CHUNK_SECONDS and outputs one Δm/Δt (g/s) per chunk."""
+ def __init__(self, chunk_duration=SCALE_CHUNK_SECONDS, max_jump_g=50.0):
+ self.chunk_duration = float(chunk_duration)
+ self.max_jump_g = float(max_jump_g)
+ self.buf = []
+ self.last_flow = None
+ def add(self, t_s, mass_g):
+ if self.buf and abs(mass_g - self.buf[-1][1]) > self.max_jump_g:
+ return None
+ self.buf.append((float(t_s), float(mass_g)))
+ if (self.buf[-1][0] - self.buf[0][0]) >= self.chunk_duration:
+ t0, m0 = self.buf[0]
+ t1, m1 = self.buf[-1]
+ dt = max(1e-6, t1 - t0)
+ self.last_flow = (m1 - m0) / dt # g/s
+ self.buf.clear()
+ return self.last_flow
+ return None
+ 
+ class RollingMean:
+ """Time-windowed simple average for SLI flows."""
+ def __init__(self, window_s: float):
+ from collections import deque
+ self.win = float(max(0.0, window_s))
+ self.deq = deque()
+ def add(self, t_s: float, value: float):
+ self.deq.append((t_s, value)); self._trim(t_s)
+ def _trim(self, now: float):
+ if self.win <= 0:
+ while len(self.deq) > 1: self.deq.popleft(); return
+ cutoff = now - self.win
+ while self.deq and self.deq[0][0] < cutoff:
+ self.deq.popleft()
+ def mean(self):
+ if not self.deq: return None
+ return sum(v for _, v in self.deq) / len(self.deq)
+ 
+ # ===================== Shared state & locks =====================
+ 
+ latest_tproc = None
+ latest_valve_state = "OFF"
+ latest_sli_flows = {} # instant mL/min by SLI
+ latest_sli_flow_avg = {} # averaged mL/min by SLI (30 s)
+ latest_mass_g = None
+ latest_dm_g_s = None # scale slope in g/s (updated every ~30 s)
+ 
+ telemetry_lock = threading.Lock()
+ csv_lock = threading.Lock()
+ stop_event = threading.Event()
+ 
+ # ===================== Small helpers =====================
+ 
+ def sli_raw_to_mlmin(raw):
+ return (raw / 5.0) / 1000.0 # raw ÷ 5 → µL/min → /1000 → mL/min
+ 
+ def apply_flow_correction(sli_port: str, flow_ml_min: float) -> float:
+ """Apply per-port linear correction; clamp at 0."""
+ cfg = FLOW_CORR.get(sli_port)
+ if not cfg:
+ return max(0.0, flow_ml_min)
+ return max(0.0, cfg["gain"] * flow_ml_min + cfg["offset"])
+ 
+ def scale_dmgs_to_mlmin(dm_raw):
+ """Convert raw scale slope (g/s) to acid flow (mL/min) with sign+deadband.
+ This is ONLY used for total flow and residence time (τ)."""
+ if dm_raw is None:
+ return None
+ dm_eff = dm_raw * SCALE_FLOW_SIGN
+ if abs(dm_eff) < SCALE_DEADBAND_GPS:
+ dm_eff = 0.0
+ return max(0.0, (dm_eff / ACID_DENSITY_G_PER_ML) * 60.0)
+ 
+ # ===================== CSV =====================
+ 
+ def csv_write_row(writer, phase, pump_com, sli_com, valve_state, tproc, sli_raw, sli_flow_ml_min,
+ mass_g=None, scale_q_ml_min=None, tri_mean=None, tri_upper=None, tau_min=None, q_total=None, event=None):
+ with csv_lock:
+ writer.writerow([
+ datetime.datetime.now().isoformat(timespec="seconds"),
+ phase or "", pump_com or "", sli_com or "", valve_state or "",
+ f"{tproc:.2f}" if tproc is not None else "",
+ str(sli_raw) if sli_raw is not None else "",
+ f"{sli_flow_ml_min:.4f}" if sli_flow_ml_min is not None else "",
+ f"{mass_g:.4f}" if mass_g is not None else "",
+ f"{scale_q_ml_min:.4f}" if scale_q_ml_min is not None else "",
+ f"{tri_mean:.5f}" if tri_mean is not None else "",
+ f"{tri_upper:.5f}" if tri_upper is not None else "",
+ f"{tau_min:.5f}" if tau_min is not None else "",
+ f"{q_total:.5f}" if q_total is not None else "",
+ event or "",
+ ])
+ 
+ # ===================== ML helpers (bundle) =====================
+ 
+ _loaded_bundle = None
+ 
+ def _ensure_model_loaded():
+ """Loads tri_predictor_1p8_bundle.joblib once."""
+ global _loaded_bundle
+ if _loaded_bundle is None and USE_ML_MODEL:
+ try:
+ _loaded_bundle = joblib_load(MODEL_PATH)
+ print(f"[ML] Loaded bundle from {MODEL_PATH} | type={_loaded_bundle.get('type')}")
+ except Exception as e:
+ print(f"[ML] Load failed: {e} — falling back to simulation")
+ _loaded_bundle = None
+ 
+ def _featurizer_for_bundle(bundle):
+ drop_acid = bundle.get("drop_acid", False)
+ def featurizer_v1_3to9(X):
+ # X columns expected: [Temp, H2SO4, time_sec]; we pass zeros for H2SO4 when drop_acid=True
+ if drop_acid:
+ T = X[:, [0]]; t = X[:, [2]]
+ XT = np.c_[T, t]
+ feats = [XT, T*t, t**2, T**2]
+ return np.concatenate(feats, axis=1)
+ else:
+ T = X[:,0:1]; A = X[:,1:2]; t = X[:,2:3]
+ feats = [X, T*A, T*t, A*t, t**2, T**2, A**2]
+ return np.concatenate(feats, axis=1)
+ return featurizer_v1_3to9, drop_acid
+ 
+ def _guard_predict(bundle, X_raw, base_pred):
+ """NeighborGate domain guard: fallback to distance-weighted KNN off-domain."""
+ gate = bundle["neighbor_gate"]
+ nbr = NearestNeighbors(n_neighbors=gate["k"]).fit(gate["X"])
+ d, _ = nbr.kneighbors(X_raw.astype(np.float32))
+ dmin = d[:, 0]
+ out = base_pred.copy()
+ off = dmin > float(gate["max_dist"])
+ if np.any(off):
+ knn = KNeighborsRegressor(n_neighbors=gate["k"], weights="distance")
+ knn.fit(gate["X"], gate["y"])
+ out[off] = knn.predict(X_raw[off])
+ return out, dmin
+ 
+ def _predict_mean_upper(temp_c, time_min):
+ """
+ Returns (mean_pred, upper_pred) in mg/mL using the deployed bundle.
+ NOTE: training used SECONDS; convert minutes → seconds here.
+ """
+ if _loaded_bundle is None:
+ return None, None
+ b = _loaded_bundle
+ fe, drop_acid = _featurizer_for_bundle(b)
+ 
+ # Convert minutes to SECONDS for the model
+ t_sec = float(time_min) * 60.0
+ 
+ # Raw for NeighborGate (gate expects [Temp, time_sec] when drop_acid=True)
+ X_raw = np.array([[float(temp_c), t_sec]], dtype=np.float32)
+ 
+ # Featurizer gets [Temp, H2SO4, time_sec]; pass 0 for H2SO4
+ Xf = fe(np.c_[X_raw[:,0], np.zeros_like(X_raw[:,0]), X_raw[:,1]])
+ 
+ # Mean prediction (bundle knows if it used log1p)
+ yhat_f = b["mean_model"].predict(Xf).astype(np.float32).ravel()
+ mean_pred = (np.expm1(yhat_f) if b.get("use_log1p", True) else yhat_f).astype(np.float32)
+ 
+ # Conformal upper band
+ up_pred = mean_pred + float(b["conformal_delta"])
+ mean_guarded, dmin = _guard_predict(b, X_raw, mean_pred)
+ upper_margin = max(float(b["conformal_delta"]), float(b["residual_q95"]))
+ up_guarded = np.maximum(up_pred, mean_guarded + upper_margin)
+ 
+ return float(max(0.0, mean_guarded[0])), float(max(0.0, up_guarded[0]))
+ 
+ # ===================== Threads =====================
+ 
+ def sampler_thread_func(scale, chunker: ChunkedSlope):
+ """Reads huber temp every second; buffers scale for 30 s slopes."""
+ global latest_tproc, latest_mass_g, latest_dm_g_s
+ while not stop_event.is_set():
+ tproc = safe_read_huber_tprocess()
+ mass = None
+ if scale:
+ try:
+ mass = scale.read_mass_g()
+ if mass is not None:
+ flow_gs = chunker.add(time.time(), mass)
+ if flow_gs is not None:
+ with telemetry_lock:
+ latest_dm_g_s = flow_gs
+ except (serial.SerialException, OSError, ValueError):
+ mass = None
+ with telemetry_lock:
+ latest_tproc = tproc if tproc is not None else latest_tproc
+ latest_mass_g = mass if mass is not None else latest_mass_g
+ time.sleep(SAMPLE_DT)
+ 
+ def pump_worker(pump_com, sli_com, start_time, writer):
+ print(f"Starting pump thread: {pump_com} ↔ {sli_com}")
+ pump = None
+ meter = None
+ last_print = 0.0
+ sli_roller = RollingMean(SLI_AVG_WINDOW_S)
+ try:
+ pump = EldexPump(pump_com)
+ meter = SLI2000(sli_com)
+ meter.start()
+ for _ in range(3):
+ try: meter.read_raw()
+ except: pass
+ time.sleep(0.05)
+ 
+ rate = PUMP_SETPOINTS.get(pump_com, PUMP_TEST_RATE)
+ resp = pump.set_rate(rate).strip()
+ print(f"[{pump_com}] set_rate {rate:.3f} mL/min → {resp}")
+ print(f"[{pump_com}] RUN…")
+ pump.start()
+ 
+ while not stop_event.is_set():
+ now = time.time()
+ if (now - start_time) >= RUN_SECONDS:
+ break
+ 
+ # SLI instant → averaged over 30 s
+ sli_raw = sli_flow = None
+ try:
+ sli_raw = meter.read_raw()
+ sli_flow = sli_raw_to_mlmin(sli_raw)
+ sli_flow = apply_flow_correction(sli_com, sli_flow) if sli_flow is not None else None
+ except Exception:
+ pass
+ 
+ if sli_flow is not None:
+ now_ts = time.time()
+ sli_roller.add(now_ts, sli_flow)
+ sli_avg = sli_roller.mean()
+ else:
+ sli_avg = None
+ 
+ if sli_avg is not None and sli_avg < 0:
+ sli_avg = 0.0
+ 
+ with telemetry_lock:
+ if sli_flow is not None:
+ latest_sli_flows[sli_com] = sli_flow
+ if sli_avg is not None:
+ latest_sli_flow_avg[sli_com] = sli_avg
+ tproc = latest_tproc
+ vstate = latest_valve_state
+ mass_g = latest_mass_g
+ dm_g_s_snapshot = latest_dm_g_s
+ 
+ scale_q_ml_min = scale_dmgs_to_mlmin(dm_g_s_snapshot)
+ 
+ csv_write_row(writer, f"pump_{pump_com}", pump_com, sli_com, vstate,
+ tproc, sli_raw, (sli_avg if sli_avg is not None else sli_flow),
+ mass_g=mass_g, scale_q_ml_min=scale_q_ml_min)
+ 
+ if (now - last_print) >= PRINT_PERIOD:
+ s_txt = f"{(sli_avg if sli_avg is not None else sli_flow):.3f} mL/min" if (sli_avg is not None or sli_flow is not None) else "—"
+ sc_txt = f"{scale_q_ml_min:.3f} mL/min" if scale_q_ml_min is not None else "—"
+ t_txt = f"{tproc:.2f} °C" if tproc is not None else "—"
+ print(f"[{pump_com}] t={int(now-start_time)}s | SLI(avg) {s_txt} | Scale(acid flow) {sc_txt} | Valve {vstate} | Tproc {t_txt}")
+ last_print = now
+ 
+ time.sleep(max(0.0, SAMPLE_DT - (time.time() - now)))
+ 
+ print(f"[{pump_com}] STOP…")
+ try: pump.stop()
+ except: pass
+ 
+ except Exception as e:
+ print(f"[{pump_com}] ✗ Worker error: {e}")
+ finally:
+ if pump: pump.close()
+ if meter: meter.close()
+ 
+ # -------- Valve scheduler (with countdown peek) --------
+ 
+ class ValveEventScheduler:
+ def __init__(self, valve, writer, get_valve_state_cb):
+ self.valve = valve
+ self.pq = []
+ self.lock = threading.Lock()
+ self.writer = writer
+ self.get_valve_state = get_valve_state_cb
+ self._next_fire = None
+ self._next_action = None
+ def replace_with(self, t_fire, action): # cancel any pending, keep latest only
+ with self.lock:
+ self.pq = [(t_fire, action)]
+ self._next_fire = float(t_fire)
+ self._next_action = str(action)
+ def peek_next_event(self):
+ with self.lock:
+ if not self._next_fire:
+ return None, None
+ remaining = max(0.0, self._next_fire - time.time())
+ return self._next_action, remaining
+ def loop(self):
+ while not stop_event.is_set():
+ now = time.time()
+ fire = None
+ with self.lock:
+ if self.pq and self.pq[0][0] <= now:
+ fire = heapq.heappop(self.pq)
+ self._next_fire = None
+ self._next_action = None
+ if fire:
+ _, action = fire
+ state_before = self.get_valve_state()
+ want_on = (action == "ON")
+ self.valve.set(want_on)
+ with telemetry_lock:
+ global latest_valve_state
+ latest_valve_state = "ON" if want_on else "OFF"
+ vstate = latest_valve_state
+ csv_write_row(self.writer, "valve_event", "", "", vstate,
+ latest_tproc, None, None,
+ mass_g=latest_mass_g, scale_q_ml_min=scale_dmgs_to_mlmin(latest_dm_g_s),
+ tri_mean=None, tri_upper=None, tau_min=None, q_total=None,
+ event=action)
+ print(f">> Valve {action} @ {datetime.datetime.now().strftime('%H:%M:%S')} (was {state_before})")
+ # Clear pending latch in control loop (best-effort)
+ try:
+ control_thread_func._pending = None
+ except Exception:
+ pass
+ else:
+ time.sleep(0.05)
+ 
+ # -------- Control loop (with ML + heartbeat + latch) --------
+ 
+ # --- Normalize actions globally ---
+ DIVERT_ACTION = ("ON" if VALVE_COLLECT_ACTION == "OFF" else "OFF") # sends flow to WASTE
+ COLLECT_ACTION = VALVE_COLLECT_ACTION # keeps product
+ 
+ def action_mode(act: str) -> str:
+ return "DIVERT" if act == DIVERT_ACTION else "COLLECT"
+ 
+ def schedule_with_latch(desired_action, fire_time, reason_txt, low_votes, tau_sched):
+ """
+ Latch-aware scheduling with:
+ - quality-first override (DIVERT replaces pending COLLECT immediately),
+ - no-cancel window for pending DIVERT,
+ - sustained-low & τ-shift gate to cancel opposite actions safely,
+ - safe None handling for _pending.
+ """
+ pend = getattr(control_thread_func, "_pending", None)
+ desired_mode = action_mode(desired_action)
+ now = time.time()
+ 
+ if pend is None:
+ control_thread_func._pending = {
+ "action": desired_action,
+ "fire_time": float(fire_time),
+ "no_cancel_until": (now + NO_CANCEL_SEC) if desired_mode == "DIVERT" else 0.0,
+ "tau_at_sched": float(tau_sched),
+ }
+ valve_scheduler.replace_with(fire_time, desired_action)
+ print(reason_txt + " (scheduled new)")
+ return
+ 
+ pend_action = pend.get("action", COLLECT_ACTION)
+ pend_mode = action_mode(pend_action)
+ pend_fire = float(pend.get("fire_time", fire_time))
+ pend_nocan = float(pend.get("no_cancel_until", 0.0))
+ pend_tau = float(pend.get("tau_at_sched", tau_sched))
+ 
+ # Quality-first: DIVERT overrides pending COLLECT immediately
+ if pend_mode == "COLLECT" and desired_mode == "DIVERT":
+ control_thread_func._pending = {
+ "action": desired_action,
+ "fire_time": float(fire_time),
+ "no_cancel_until": now + NO_CANCEL_SEC,
+ "tau_at_sched": float(tau_sched),
+ }
+ valve_scheduler.replace_with(fire_time, desired_action)
+ print(reason_txt + " (replaced pending COLLECT — quality first)")
+ return
+ 
+ # Same action pending → only update if materially earlier (≥10% sooner)
+ if pend_action == desired_action:
+ if fire_time <= pend_fire * 0.90:
+ control_thread_func._pending["fire_time"] = float(fire_time)
+ valve_scheduler.replace_with(fire_time, desired_action)
+ print(reason_txt + " (updated earlier fire time)")
+ return
+ 
+ # Opposite action pending:
+ if pend_mode == "DIVERT" and now < pend_nocan:
+ return # protect pending DIVERT
+ 
+ sustained_low = (sum(low_votes[-CANCEL_LOW_N:]) >= CANCEL_LOW_K) if len(low_votes) >= CANCEL_LOW_N else False
+ tau_shift_ok = (abs(tau_sched - pend_tau) / max(1e-6, pend_tau)) >= CANCEL_TAU_SHIFT_FRAC
+ 
+ if sustained_low and tau_shift_ok:
+ control_thread_func._pending = {
+ "action": desired_action,
+ "fire_time": float(fire_time),
+ "no_cancel_until": (now + NO_CANCEL_SEC) if desired_mode == "DIVERT" else 0.0,
+ "tau_at_sched": float(tau_sched),
+ }
+ valve_scheduler.replace_with(fire_time, desired_action)
+ print(reason_txt + " (replaced opposite; sustained low & τ shift)")
+ # else: keep existing
+ 
+ def control_thread_func(valve_scheduler, writer):
+ _ensure_model_loaded()
+ 
+ state = "RUN" # or "DIVERT"
+ upper_ewma = None
+ votes = [] # last N booleans (EWMA >= UPPER_T_HI)
+ low_votes = [] # last N booleans (EWMA <= UPPER_T_LO)
+ hold = 0 # min-hold counter
+ last_tproc = 80.0 # default temp if Huber unavailable
+ last_status = 0.0
+ # Latch state
+ control_thread_func._pending = None # {"action","fire_time","no_cancel_until","tau_at_sched"}
+ control_thread_func._arm_start = None # time when EWMA crossed UPPER_T_HI
+ 
+ t0 = time.time()
+ 
+ while not stop_event.is_set():
+ tic = time.time()
+ with telemetry_lock:
+ tproc = latest_tproc if latest_tproc is not None else last_tproc
+ sli_avg_map = dict(latest_sli_flow_avg)
+ sli_inst_map= dict(latest_sli_flows)
+ vstate = latest_valve_state
+ dm_raw = latest_dm_g_s
+ 
+ if tproc is not None:
+ last_tproc = tproc
+ 
+ # Prefer averaged SLI; fallback to instant
+ q_main = sli_avg_map.get(MAIN_HBA_SLI_COM) or sli_inst_map.get(MAIN_HBA_SLI_COM)
+ 
+ tri_mean = None
+ tri_upper = None
+ tau_min = None
+ q_total = None
+ 
+ try:
+ if q_main is not None and q_main > 0.0:
+ # Acid flow from scale (mL/min); ONLY used for total flow / τ
+ q_acid_ml_min = scale_dmgs_to_mlmin(dm_raw) or 0.0
+ 
+ q_total = q_main + q_acid_ml_min
+ tau_min = REACTOR_VOLUME_ML / max(q_total, 1e-12)
+ 
+ # ----- ML: mean & upper (Temp, τ only) -----
+ tri_mean, tri_upper = _predict_mean_upper(last_tproc, tau_min)
+ 
+ # Fallback simulation if ML unavailable (optional)
+ if tri_mean is None or tri_upper is None:
+ tau_sec = max(1.0, float(tau_min) * 60.0)
+ good_sec = (2.0/3.0) * tau_sec
+ bad_sec = (1.0/3.0) * tau_sec
+ cycle = good_sec + bad_sec
+ t_elapsed = (time.time() - t0) % cycle
+ tri_mean = 0.06 if t_elapsed <= good_sec else 0.11
+ tri_upper = tri_mean + 0.02
+ 
+ # ----- Decision policy (EWMA + hysteresis + votes) on Upper -----
+ prev_state = state
+ 
+ # 1) EWMA smoothing
+ if upper_ewma is None:
+ upper_ewma = tri_upper
+ else:
+ upper_ewma = EWMA_ALPHA * tri_upper + (1 - EWMA_ALPHA) * upper_ewma
+ 
+ # 2) Votes
+ votes.append(upper_ewma >= UPPER_T_HI)
+ if len(votes) > VOTE_N: votes.pop(0)
+ v_hi = sum(votes[-VOTE_N:]) if len(votes) >= 1 else 0
+ 
+ low_votes.append(upper_ewma <= UPPER_T_LO)
+ if len(low_votes) > CANCEL_LOW_N: low_votes.pop(0)
+ v_low = sum(low_votes[-CANCEL_LOW_N:]) if len(low_votes) >= 1 else 0
+ 
+ # 3) State machine with holds
+ if state == "RUN":
+ if hold == 0 and v_hi >= VOTE_K:
+ state = "DIVERT"
+ hold = MIN_DIVERT_HOLD
+ else: # DIVERT
+ if hold == 0 and upper_ewma <= UPPER_T_LO:
+ state = "RUN"
+ hold = MIN_RUN_HOLD
+ if hold > 0:
+ hold -= 1
+ 
+ # ----- τ smoothing for scheduling (timing) only -----
+ if not hasattr(control_thread_func, "_tau_sched"):
+ control_thread_func._tau_sched = tau_min if tau_min is not None else 0.0
+ else:
+ if tau_min is not None:
+ control_thread_func._tau_sched = (
+ TAU_SMOOTH_ALPHA * tau_min + (1 - TAU_SMOOTH_ALPHA) * control_thread_func._tau_sched
+ )
+ tau_sched = control_thread_func._tau_sched
+ 
+ # ----- Arm timer management -----
+ now_ts = time.time()
+ if upper_ewma is not None and upper_ewma >= UPPER_T_HI:
+ if control_thread_func._arm_start is None:
+ control_thread_func._arm_start = now_ts
+ else:
+ control_thread_func._arm_start = None
+ armed_for = 0.0 if control_thread_func._arm_start is None else (now_ts - control_thread_func._arm_start)
+ 
+ # ---- Transport-of-fluid helper ----
+ def remaining_reactor_vol_ml_from_fraction(f):
+ f = min(max(f, 0.0), 1.0)
+ return (1.0 - f) * REACTOR_VOLUME_ML
+ 
+ def tof_seconds_parts(f, q_total_internal_ml_min):
+ if not q_total_internal_ml_min or q_total_internal_ml_min <= 0:
+ t_reactor_s = 0.0
+ else:
+ rem_reactor_ml = remaining_reactor_vol_ml_from_fraction(f)
+ t_reactor_s = (rem_reactor_ml / q_total_internal_ml_min) * 60.0
+ total_post_ml = POSTREACTOR_VOLUME_ML + EXTRA_POST_TUBING_ML
+ t_line_s = (total_post_ml / POST_LINE_FIXED_Q_ML_MIN) * 60.0
+ return t_reactor_s, t_line_s, max(0.0, t_reactor_s + t_line_s)
+ 
+ # ---- When to fire (DIVERT / COLLECT) ----
+ def compute_fire(action, q_tot, tau_s):
+ if FAST_DIVERT and action == DIVERT_ACTION:
+ ft = time.time() + VALVE_ACTUATION_LATENCY_S
+ return ft, f"{VALVE_ACTUATION_LATENCY_S:.1f}s (FAST)"
+ if action == DIVERT_ACTION:
+ start_f = max(DECISION_REF_FRACTION, SAFE_GOOD_FRACTION)
+ else:
+ start_f = DECISION_REF_FRACTION
+ tR, tL, delay_sec = tof_seconds_parts(start_f, q_tot)
+ extra = (delay_sec * DIVERSION_EXTRA_FRAC) if action == COLLECT_ACTION else 0.0
+ ft = time.time() + delay_sec + extra + VALVE_ACTUATION_LATENCY_S
+ txt = f"{delay_sec + extra + VALVE_ACTUATION_LATENCY_S:.1f}s (reactor {tR:.1f}s + line {tL:.1f}s{', +' + str(int(DIVERSION_EXTRA_FRAC*100)) + '%' if action == COLLECT_ACTION and DIVERSION_EXTRA_FRAC>0 else ''})"
+ return ft, txt
+ 
+ def is_pending(action):
+ pend = getattr(control_thread_func, "_pending", None)
+ return bool(pend and pend.get("action") == action)
+ 
+ if q_total and q_total > 0:
+ # --- DIVERT scheduling ---
+ divert_fire, divert_txt = compute_fire(DIVERT_ACTION, q_total, tau_sched)
+ # 1) classic transition, but only if armed
+ if prev_state == "RUN" and state == "DIVERT" and armed_for >= ENTRY_ARM_SEC:
+ schedule_with_latch(
+ DIVERT_ACTION, divert_fire,
+ f"[SCHED] DIVERT in {divert_txt} | q_total={q_total:.3f} mL/min | τ_sched~{tau_sched:.2f} min | Upper_EWMA={upper_ewma:.3f}",
+ low_votes, tau_sched
+ )
+ # 2) already DIVERT; arm timer matured; nothing pending
+ elif state == "DIVERT" and armed_for >= ENTRY_ARM_SEC and not is_pending(DIVERT_ACTION):
+ schedule_with_latch(
+ DIVERT_ACTION, divert_fire,
+ f"[SCHED] DIVERT (armed while DIVERT) in {divert_txt} | q_total={q_total:.3f} mL/min | τ_sched~{tau_sched:.2f} min | Upper_EWMA={upper_ewma:.3f}",
+ low_votes, tau_sched
+ )
+ 
+ # --- COLLECT scheduling ---
+ collect_fire, collect_txt = compute_fire(COLLECT_ACTION, q_total, tau_sched)
+ # 1) classic transition: DIVERT -> RUN
+ if prev_state == "DIVERT" and state == "RUN":
+ schedule_with_latch(
+ COLLECT_ACTION, collect_fire,
+ f"[SCHED] COLLECT in {collect_txt} | q_total={q_total:.3f} mL/min | τ_sched~{tau_sched:.2f} min | Upper_EWMA={upper_ewma:.3f}",
+ low_votes, tau_sched
+ )
+ # 2) already RUN and EWMA beneath low threshold; nothing pending
+ elif state == "RUN" and upper_ewma is not None and upper_ewma <= UPPER_T_LO and not is_pending(COLLECT_ACTION):
+ schedule_with_latch(
+ COLLECT_ACTION, collect_fire,
+ f"[SCHED] COLLECT (confirmed low while RUN) in {collect_txt} | q_total={q_total:.3f} mL/min | τ_sched~{tau_sched:.2f} min | Upper_EWMA={upper_ewma:.3f}",
+ low_votes, tau_sched
+ )
+ 
+ except Exception as e:
+ print(f"[CTRL] Error in control loop: {e}")
+ 
+ # Log control row
+ csv_write_row(
+ writer, "control", "", "", vstate, last_tproc, None, None,
+ mass_g=latest_mass_g, scale_q_ml_min=scale_dmgs_to_mlmin(dm_raw),
+ tri_mean=tri_mean, tri_upper=tri_upper, tau_min=tau_min, q_total=q_total,
+ event=state
+ )
+ 
+ # ---- 60 s ML heartbeat print (with next-event countdown & diagnostics) ----
+ if (time.time() - last_status) >= STATUS_EVERY_S:
+ tau_txt = f"{tau_min:.2f}" if tau_min is not None else "—"
+ mean_txt = f"{tri_mean:.3f}" if tri_mean is not None else "—"
+ up_txt = f"{tri_upper:.3f}" if tri_upper is not None else "—"
+ ew_txt = f"{upper_ewma:.3f}" if upper_ewma is not None else "—"
+ nxt_act, nxt_in = valve_scheduler.peek_next_event()
+ nxt_txt = f"{nxt_act} in {int(nxt_in)}s" if nxt_act else "—"
+ armed_for = 0.0 if control_thread_func._arm_start is None else (time.time() - control_thread_func._arm_start)
+ v_hi = sum(votes[-VOTE_N:]) if len(votes) >= 1 else 0
+ v_low = sum(low_votes[-CANCEL_LOW_N:]) if len(low_votes) >= 1 else 0
+ print(
+ f"[ML] Temp {last_tproc:.1f} °C | τ {tau_txt} min | Mean {mean_txt} | Upper {up_txt} | "
+ f"EWMA {ew_txt} | Valve {vstate} | State {state} | Arm {int(armed_for)}s | "
+ f"v_hi={v_hi}/{VOTE_N} v_low={v_low}/{CANCEL_LOW_N} | Next {nxt_txt}"
+ )
+ last_status = time.time()
+ 
+ time.sleep(max(0.0, SAMPLE_DT - (time.time() - tic)))
+ 
+ # ===================== main =====================
+ 
+ def main():
+ print(f"Mode: {MODE} | CSV → {CSV_NAME}")
+ 
+ # Scale (water) with 30 s chunked slope
+ scale = None
+ chunker = ChunkedSlope(SCALE_CHUNK_SECONDS)
+ if SCALE_PORT:
+ try:
+ scale = BenchScale(SCALE_PORT, SCALE_BAUD, SCALE_TIMEOUT_S)
+ print(f"Scale connected on {SCALE_PORT} (poll cmd {scale._poll_cmd!r}, {SCALE_POLL_PERIOD_S:.2f}s, chunk {SCALE_CHUNK_SECONDS:.0f}s)")
+ except Exception as e:
+ print(f"Scale open failed on {SCALE_PORT}: {e}")
+ scale = None
+ 
+ valve = ValveU3(VALVE_IO_NUM)
+ valve.set(False) # OFF = collect
+ global latest_valve_state
+ latest_valve_state = "OFF"
+ 
+ with open(CSV_NAME, "w", newline="") as f:
+ writer = csv.writer(f)
+ writer.writerow([
+ "timestamp","phase","pump_com","sli_com","valve_state",
+ "huber_tproc_c","sli_raw","sli_flow_ml_min",
+ "scale_mass_g","scale_acid_flow_ml_min",
+ "tri_mean","tri_upper","tau_min","q_total_ml_min","event"
+ ])
+ 
+ # Threads: sampler (Huber+Scale), scheduler, control, pumps
+ t0 = time.time()
+ samp_thr = threading.Thread(target=sampler_thread_func, args=(scale, chunker), daemon=True)
+ samp_thr.start()
+ 
+ global valve_scheduler
+ valve_scheduler = ValveEventScheduler(valve, writer, lambda: latest_valve_state)
+ sched_thr = threading.Thread(target=valve_scheduler.loop, daemon=True)
+ sched_thr.start()
+ 
+ control_thr = threading.Thread(target=control_thread_func, args=(valve_scheduler, writer), daemon=True)
+ control_thr.start()
+ 
+ # Pump workers
+ workers = []
+ for pump_com, sli_com in PAIRS:
+ th = threading.Thread(target=pump_worker, args=(pump_com, sli_com, t0, writer), daemon=True)
+ th.start()
+ workers.append(th)
+ 
+ # Run window
+ try:
+ while (time.time() - t0) < RUN_SECONDS:
+ time.sleep(0.5)
+ finally:
+ stop_event.set()
+ 
+ for th in workers:
+ th.join(timeout=2.0)
+ 
+ valve.set(False)
+ 
+ try: valve.close()
+ except: pass
+ if scale: scale.close()
+ 
+ print(f"\nRun complete. CSV saved: {CSV_NAME}")
+ 
+ if __name__ == "__main__":
+ main()
